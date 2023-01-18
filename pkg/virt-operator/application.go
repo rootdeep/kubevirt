@@ -91,6 +91,8 @@ type VirtOperatorApp struct {
 	kubeVirtInformer cache.SharedIndexInformer
 	kubeVirtCache    cache.Store
 
+	crdInformer cache.SharedIndexInformer
+
 	stores    util.Stores
 	informers util.Informers
 
@@ -99,6 +101,11 @@ type VirtOperatorApp struct {
 	operatorCertManager certificate.Manager
 
 	clusterConfig *virtconfig.ClusterConfig
+	//host          string
+
+	ctx context.Context
+
+	reInitChan chan string
 }
 
 var (
@@ -223,6 +230,8 @@ func Execute() {
 		ConfigMapCache:                app.informerFactory.OperatorConfigMap().GetStore(),
 	}
 
+	app.crdInformer = app.informerFactory.CRD()
+
 	onOpenShift, err := clusterutil.IsOnOpenShift(app.clientSet)
 	if err != nil {
 		golog.Fatalf("Error determining cluster type: %v", err)
@@ -282,9 +291,18 @@ func Execute() {
 
 	app.clusterConfig = virtconfig.NewClusterConfig(app.informerFactory.CRD(),
 		app.informerFactory.KubeVirt(),
-		app.operatorNamespace)
+		app.operatorNamespace,
+	)
 
-	app.Run()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	app.ctx = ctx
+
+	app.reInitChan = make(chan string, 0)
+	//app.clusterConfig.SetConfigModifiedCallback(app.shouldChangeLogVerbosity)
+
+	go app.Run()
+	<-app.reInitChan
 }
 
 func (app *VirtOperatorApp) Run() {
@@ -317,9 +335,6 @@ func (app *VirtOperatorApp) Run() {
 		}
 	}()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	endpointName := VirtOperator
 
 	recorder := app.getNewRecorder(k8sv1.NamespaceAll, endpointName)
@@ -344,8 +359,13 @@ func (app *VirtOperatorApp) Run() {
 
 	apiAuthConfig := app.informerFactory.ApiAuthConfigMap()
 
-	stop := ctx.Done()
+	stop := app.ctx.Done()
 	app.informerFactory.Start(stop)
+
+	stopChan := app.ctx.Done()
+	cache.WaitForCacheSync(stopChan, app.crdInformer.HasSynced, app.kubeVirtInformer.HasSynced)
+	app.clusterConfig.SetConfigModifiedCallback(app.configModificationCallback)
+
 	cache.WaitForCacheSync(stop, apiAuthConfig.HasSynced)
 
 	go app.operatorCertManager.Start()
@@ -404,9 +424,37 @@ func (app *VirtOperatorApp) Run() {
 
 	readyGauge.Set(1)
 	log.Log.Infof("Attempting to acquire leader status")
-	leaderElector.Run(ctx)
+	leaderElector.Run(app.ctx)
+
 	panic("unreachable")
 
+}
+
+// Detects if ServiceMonitor or PrometheusRule crd has been applied or deleted that
+// re-initializing virt-operator.
+func (app *VirtOperatorApp) configModificationCallback() {
+	msgf := "Reinitialize virt-operator, %s has been %s"
+
+	smEnabled := app.clusterConfig.HasServiceMonitorAPI()
+	if app.stores.ServiceMonitorEnabled != smEnabled {
+		if !app.stores.ServiceMonitorEnabled && smEnabled {
+			log.Log.Infof(msgf, "ServiceMonitor", "introduced")
+		} else {
+			log.Log.Infof(msgf, "ServiceMonitor", "removed")
+		}
+		app.reInitChan <- "reinit"
+		return
+	}
+
+	prEnabled := app.clusterConfig.HasPrometheusRuleAPI()
+	if app.stores.PrometheusRulesEnabled != prEnabled {
+		if !app.stores.PrometheusRulesEnabled && prEnabled {
+			log.Log.Infof(msgf, "PrometheusRule", "introduced")
+		} else {
+			log.Log.Infof(msgf, "PrometheusRule", "removed")
+		}
+		app.reInitChan <- "reinit"
+	}
 }
 
 func (app *VirtOperatorApp) getNewRecorder(namespace string, componentName string) record.EventRecorder {
@@ -433,3 +481,12 @@ func (app *VirtOperatorApp) prepareCertManagers() {
 		),
 	)
 }
+
+// func (app *VirtOperatorApp) shouldChangeLogVerbosity() {
+// 	verbosity := app.clusterConfig.GetVirtOperatorVerbosity(app.host)
+// 	if err := log.Log.SetVerbosityLevel(int(verbosity)); err != nil {
+// 		log.Log.Warningf("failed up update log verbosity to %d: %v", verbosity, err)
+// 	} else {
+// 		log.Log.V(2).Infof("set log verbosity to %d", verbosity)
+// 	}
+// }
